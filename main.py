@@ -1,4 +1,5 @@
 import os
+import re
 import json
 from telegram import (
     Update,
@@ -8,14 +9,19 @@ from telegram import (
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     ConversationHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 from dotenv import load_dotenv
 
+# ==================== PRD IMPORTS ====================
+import spacy
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+# ====================================================
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -24,6 +30,106 @@ ASKING_PATH, ASKING_ALERTS_PATH = range(2)
 user_paths = {}
 alerts_paths = {}
 
+# ==================== PRD 1: spaCy Parser Setup ====================
+nlp = spacy.load("en_core_web_sm")
+
+def parse_trade_signal(raw_text: str) -> dict:
+    """
+    PRD 1:
+      • Use spaCy rule-based parsing to extract action, symbol, entry, TP1-n, SL.
+      • Normalize variants, ignore emojis/delimiters.
+      • Return structured dict for Google Sheets.
+    """
+    text = raw_text.upper()
+    doc = nlp(text)
+    lines = [re.sub(r"[^\w.\s:-]", "", l).strip() for l in text.splitlines() if l.strip()]
+
+    result = {
+        "user_id": None,      # filled later
+        "action": None,
+        "symbol": None,
+        "entry_min": None,
+        "entry_max": None,
+        "sl": None,
+        "tp": [],             # will map to tp1, tp2… in sheet
+        "status": "pending",  # PRD 1
+        "copy_mode": None     # filled per-user from UserConfig (PRD 4)
+    }
+
+    for line in lines:
+        # BUY/SELL + SYMBOL [+ single entry]
+        m = re.match(r"(BUY|SELL)\s+([A-Z]{3,6})(?:\s+([\d.]+))?", line)
+        if m:
+            action, symbol, entry = m.groups()
+            result["action"], result["symbol"] = action, symbol
+            if entry:
+                result["entry_min"] = result["entry_max"] = float(entry)
+            continue
+
+        # ENTRY range or single
+        if line.startswith("ENTRY"):
+            nums = re.findall(r"[\d.]+", line)
+            if len(nums) == 1:
+                result["entry_min"] = result["entry_max"] = float(nums[0])
+            elif len(nums) >= 2:
+                e1, e2 = map(float, nums[:2])
+                result["entry_min"], result["entry_max"] = sorted((e1, e2))
+            continue
+
+        # SL
+        if "SL" in line:
+            nums = re.findall(r"[\d.]+", line)
+            result["sl"] = float(nums[0])
+            continue
+
+        # TP
+        if "TP" in line:
+            nums = re.findall(r"[\d.]+", line)
+            if nums:
+                result["tp"].append(float(nums[0]))
+            continue
+
+    return result
+# ================================================================
+
+# ==================== PRD 3: Google Sheets Setup ====================
+# Assumes you have a service account JSON key in env var SHEETS_CREDS_JSON
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+CREDS = service_account.Credentials.from_service_account_file(
+    os.getenv("SHEETS_CREDS_JSON"), scopes=SCOPES
+)
+SHEETS = build("sheets", "v4", credentials=CREDS)
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+
+def append_order_to_sheet(order: dict):
+    """
+    PRD 1 & 3:
+    • Map parsed fields to the “Orders” sheet columns:
+      [ user_id, action, symbol, entry_min, entry_max, sl, tp1, tp2…, status, copy_mode ]
+    • Append a new row via Sheets API.
+    """
+    row = [
+        order["user_id"],
+        order["action"],
+        order["symbol"],
+        order["entry_min"],
+        order["entry_max"],
+        order["sl"],
+    ] + order["tp"] + [
+        order["status"],
+        order["copy_mode"]
+    ]
+    # Write to Orders sheet, starting at A1 header row
+    SHEETS.spreadsheets().values().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range="Orders!A2",
+        valueInputOption="USER_ENTERED",
+        body={"values": [row]}
+    ).execute()
+# ============================================================
+
+
+
 # ========== Inline Keyboard ==========
 def main_menu():
     keyboard = [
@@ -31,7 +137,8 @@ def main_menu():
         [InlineKeyboardButton("Sell", callback_data="sell_prompt")],
         [InlineKeyboardButton("Set Orders Path", callback_data="set_path")],
         [InlineKeyboardButton("Set Alerts Path", callback_data="set_alerts_path")],
-        [InlineKeyboardButton("Set Alert", callback_data="set_alert_prompt")]
+        [InlineKeyboardButton("Set Alert", callback_data="set_alert_prompt")],
+        [InlineKeyboardButton("Parse Signal", callback_data="parse_signal")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -225,15 +332,53 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         , parse_mode="Markdown"
     )
 
+async def handle_parse_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Handle callback vs message
+    if update.message:
+        text = " ".join(context.args or [])
+        if not text and update.message.reply_to_message:
+            text = update.message.reply_to_message.text
+    elif update.callback_query:
+        await update.callback_query.answer()
+        text = "BUY EURUSD 1.1000\nTP1 1.1050\nSL 1.0950"  # Example default text
+    else:
+        text = ""
+
+    if not text:
+        await context.bot.send_message(
+            chat_id=update.effective_user.id,
+            text="⚠️ No signal text provided or replied to."
+        )
+        return
+
+    parsed = parse_trade_signal(text)
+    parsed["user_id"] = str(update.effective_user.id)
+    parsed["copy_mode"] = "pending"
+
+    append_order_to_sheet(parsed)
+
+    await context.bot.send_message(
+        chat_id=update.effective_user.id,
+        text=f"✅ Parsed and sent to Orders sheet:\n```json\n{json.dumps(parsed, indent=2)}```",
+        parse_mode="Markdown"
+    )
+
 # ========== Setup ==========
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 # Command handlers
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("parse", handle_parse_signal))
 app.add_handler(CommandHandler("buy", buy))
 app.add_handler(CommandHandler("sell", sell))
 app.add_handler(CommandHandler("alert", alert))
 app.add_handler(CommandHandler("help", help_cmd))
+
+app.add_handler(CallbackQueryHandler(lambda u,c: c.bot.send_message(
+    chat_id=u.callback_query.from_user.id,
+    text="Feature in Phase 2/3"
+), pattern="^(buy_prompt|sell_prompt|set_path|set_alerts_path)$"))
+app.add_handler(CallbackQueryHandler(handle_parse_signal, pattern="parse_signal"))
 
 # Conversation handlers
 path_conv = ConversationHandler(
