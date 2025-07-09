@@ -128,14 +128,73 @@ def append_order_to_sheet(order: dict):
     ).execute()
 # ============================================================
 
+# ========================================
+# Phase 2: UserConfig Sheet Integration
+# ========================================
+CONFIG_RANGE = "UserConfig!A:D"
+# Columns: A=user_id, B=orders_path, C=alerts_path, D=copy_mode
 
+def get_user_config(user_id: str) -> dict:
+    """Fetches the row for user_id, returns dict with keys orders_path, alerts_path, copy_mode."""
+    sheet = SHEETS.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=CONFIG_RANGE
+    ).execute()
+    rows = sheet.get("values", [])
+    for row in rows[1:]:  # skip header
+        if row[0] == user_id:
+            return {
+                "orders_path": row[1] if len(row) > 1 else "",
+                "alerts_path": row[2] if len(row) > 2 else "",
+                "copy_mode": row[3] if len(row) > 3 else "pending"
+            }
+    return {"orders_path": "", "alerts_path": "", "copy_mode": "pending"}
+
+def update_user_config(user_id: str, field: str, value: str):
+    """
+    Upserts a single field in UserConfig.
+    field ∈ {"orders_path","alerts_path","copy_mode"}.
+    """
+    # 1) Read full sheet
+    sheet = SHEETS.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=CONFIG_RANGE
+    ).execute()
+    rows = sheet.get("values", [])
+    header = rows[0]
+    try:
+        idx = header.index(field)
+    except ValueError:
+        return
+
+    # 2) Find existing row or append new
+    for i,row in enumerate(rows[1:], start=1):
+        if row[0] == user_id:
+            # update cell
+            SHEETS.spreadsheets().values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"UserConfig!{chr(65+idx)}{i+1}",
+                valueInputOption="USER_ENTERED",
+                body={"values":[[value]]}
+            ).execute()
+            return
+
+    # 3) Append new row if not found
+    new_row = [user_id, "", "", ""]
+    new_row[idx] = value
+    SHEETS.spreadsheets().values().append(
+        spreadsheetId=SPREADSHEET_ID,
+        range="UserConfig!A2",
+        valueInputOption="USER_ENTERED",
+        body={"values":[new_row]}
+    ).execute()
 
 # ========== Inline Keyboard ==========
 def main_menu():
     keyboard = [
         [InlineKeyboardButton("Buy", callback_data="buy_prompt")],
         [InlineKeyboardButton("Sell", callback_data="sell_prompt")],
-        [InlineKeyboardButton("Set Orders Path", callback_data="set_path")],
+        [InlineKeyboardButton("Set Orders Path", callback_data="set_orders_path")],
         [InlineKeyboardButton("Set Alerts Path", callback_data="set_alerts_path")],
         [InlineKeyboardButton("Set Alert", callback_data="set_alert_prompt")],
         [InlineKeyboardButton("Parse Signal", callback_data="parse_signal")]
@@ -151,21 +210,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ========== Set MT5 Path ==========
-async def ask_for_path(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_orders_path(update: Update, context: ContextTypes.DEFAULT_TYPE): #Currently taking multi-step approach
     await context.bot.send_message(
         chat_id=update.effective_user.id,
-        text="📁 Please send your MT5 Files folder path."
+        text="📁 Send your MT5 Orders folder path:"
     )
     return ASKING_PATH
 
-async def save_path(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def save_orders_path(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = update.message.text.strip()
     if not os.path.exists(path):
         await update.message.reply_text("❌ That path doesn't exist. Try again.")
         return ASKING_PATH
 
     user_id = str(update.effective_user.id)
-    user_paths[user_id] = path
+    update_user_config(user_id, "orders_path", path)
     await context.bot.send_message(
         chat_id=update.effective_user.id,
         text="✅ Path saved! You can now use /buy or /sell.",
@@ -174,10 +233,10 @@ async def save_path(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ========== Set Alerts Path ==========
-async def ask_for_alerts_path(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_alerts_path(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(
         chat_id=update.effective_user.id,
-        text="📂 Please send the folder path where MT5 will read alerts.json"
+        text="📂 Please send the folder path where MT5 will read alerts.json:"
     )
     return ASKING_ALERTS_PATH
 
@@ -188,20 +247,28 @@ async def save_alerts_path(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASKING_ALERTS_PATH
 
     user_id = str(update.effective_user.id)
-    alerts_paths[user_id] = path
+    update_user_config(user_id, "alerts_path", path)
     await context.bot.send_message(
         chat_id=update.effective_user.id,
         text="✅ Alerts path saved!",
         reply_markup=main_menu()
     )
     return ConversationHandler.END
+async def set_copy_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode = (context.args[0].lower() if context.args else "")
+    if mode not in ("auto","pending"):
+        await update.message.reply_text("Usage: /setcopymode auto|pending")
+        return
+    user_id = str(update.effective_user.id)
+    update_user_config(user_id, "copy_mode", mode)
+    await update.message.reply_text(f"✅ Copy mode set to *{mode}*.", parse_mode="Markdown")
 
 # ========== Buy & Sell ==========
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_id = str(update.effective_user.id)
         if user_id not in user_paths:
-            await context.bot.send_message(chat_id=update.effective_user.id, text="⚠️ Set your MT5 path first using /setpath.")
+            await context.bot.send_message(chat_id=update.effective_user.id, text="⚠️ Set your MT5 path first using /setorderspath.")
             return
 
         symbol = context.args[0]
@@ -231,7 +298,7 @@ async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_id = str(update.effective_user.id)
         if user_id not in user_paths:
-            await context.bot.send_message(chat_id=update.effective_user.id, text="⚠️ Set your MT5 path first using /setpath.")
+            await context.bot.send_message(chat_id=update.effective_user.id, text="⚠️ Set your MT5 path first using /setorderspath.")
             return
 
         symbol = context.args[0]
@@ -265,8 +332,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     chat_id = query.from_user.id
 
-    if data == "set_path":
-        await context.bot.send_message(chat_id=chat_id, text="Click or type /setpath")
+    if data == "set_orders_path":
+        await context.bot.send_message(chat_id=chat_id, text="Click or type /setorderspath")
     elif data == "set_alerts_path":
         await context.bot.send_message(chat_id=chat_id, text="Click or type /setalertspath")
     elif data == "buy_prompt":
@@ -324,7 +391,7 @@ async def alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📘 *How to use this bot:*\n"
-        "/setpath – Set your MT5 orders file path\n"
+        "/setorderspath – Set your MT5 orders file path\n"
         "/setalertspath – Set the alerts file folder path\n"
         "/buy SYMBOL VOLUME – Place a buy order (e.g., /buy EURUSD 0.1)\n"
         "/sell SYMBOL VOLUME – Place a sell order (e.g., /sell USDJPY 0.2)\n"
@@ -373,27 +440,28 @@ app.add_handler(CommandHandler("buy", buy))
 app.add_handler(CommandHandler("sell", sell))
 app.add_handler(CommandHandler("alert", alert))
 app.add_handler(CommandHandler("help", help_cmd))
+app.add_handler(CommandHandler("setcopymode", set_copy_mode))
 
 app.add_handler(CallbackQueryHandler(lambda u,c: c.bot.send_message(
     chat_id=u.callback_query.from_user.id,
     text="Feature in Phase 2/3"
-), pattern="^(buy_prompt|sell_prompt|set_path|set_alerts_path)$"))
+), pattern="^(buy_prompt|sell_prompt|setorderspath|set_alerts_path)$"))
 app.add_handler(CallbackQueryHandler(handle_parse_signal, pattern="parse_signal"))
 
 # Conversation handlers
-path_conv = ConversationHandler(
-    entry_points=[CommandHandler("setpath", ask_for_path)],
-    states={ASKING_PATH: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_path)]},
+orders_conv = ConversationHandler(
+    entry_points=[CommandHandler("setorderspath", set_orders_path)],
+    states={ASKING_PATH: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_orders_path)]},
     fallbacks=[],
 )
 alerts_conv = ConversationHandler(
-    entry_points=[CommandHandler("setalertspath", ask_for_alerts_path)],
+    entry_points=[CommandHandler("setalertspath", set_alerts_path)],
     states={ASKING_ALERTS_PATH: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_alerts_path)]},
     fallbacks=[],
 )
 
 
-app.add_handler(path_conv)
+app.add_handler(orders_conv)
 app.add_handler(alerts_conv)
 
 # Inline button handler
