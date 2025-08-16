@@ -1,201 +1,36 @@
-import os
-import re
-import json
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+import os, json, re
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ConversationHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
+    ApplicationBuilder, CommandHandler, MessageHandler, ConversationHandler,
+    CallbackQueryHandler, ContextTypes, filters
 )
+from uuid import UUID
 from dotenv import load_dotenv
-
-# ==================== PRD IMPORTS ====================
-import spacy
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-# ====================================================
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
+from lib.supa import service_client
 # ========== State Constants ==========
+load_dotenv()
+print("DEBUG SUPABASE_URL:", os.getenv("SUPABASE_URL"))
+BOT_TOKEN = os.getenv("BOT_TOKEN")  
+sb = service_client()
+
 ASKING_PATH, ASKING_ALERTS_PATH = range(2)
 user_paths = {}
 alerts_paths = {}
 
-# ==================== PRD 1: spaCy Parser Setup ====================
-nlp = spacy.load("en_core_web_sm")
+def _link_user(telegram_user) -> str:
+    # returns user_id (uuid as string)
+    res = sb.rpc("rpc_upsert_user_by_telegram", {
+        "p_telegram_id": str(telegram_user.id),
+        "p_username": telegram_user.username or ""
+    }).execute()
+    return res.data
 
-def parse_trade_signal(raw_text: str) -> dict:
-    """
-    PRD 1:
-      • Use spaCy rule-based parsing to extract action, symbol, entry, TP1-n, SL.
-      • Normalize variants, ignore emojis/delimiters.
-      • Return structured dict for Google Sheets.
-    """
-    text = raw_text.upper()
-    doc = nlp(text)
-    lines = [re.sub(r"[^\w.\s:-]", "", l).strip() for l in text.splitlines() if l.strip()]
-
-    result = {
-        "user_id": None,      # filled later
-        "action": None,
-        "symbol": None,
-        "entry_min": None,
-        "entry_max": None,
-        "sl": None,
-        "tp": [],             # will map to tp1, tp2… in sheet
-        "status": "pending",  # PRD 1
-        "copy_mode": None     # filled per-user from UserConfig (PRD 4)
-    }
-
-    for line in lines:
-        # BUY/SELL + SYMBOL [+ single entry]
-        m = re.match(r"(BUY|SELL)\s+([A-Z]{3,6})(?:\s+([\d.]+))?", line)
-        if m:
-            action, symbol, entry = m.groups()
-            result["action"], result["symbol"] = action, symbol
-            if entry:
-                result["entry_min"] = result["entry_max"] = float(entry)
-            continue
-
-        # ENTRY range or single
-        if line.startswith("ENTRY"):
-            nums = re.findall(r"[\d.]+", line)
-            if len(nums) == 1:
-                result["entry_min"] = result["entry_max"] = float(nums[0])
-            elif len(nums) >= 2:
-                e1, e2 = map(float, nums[:2])
-                result["entry_min"], result["entry_max"] = sorted((e1, e2))
-            continue
-
-        # SL
-        if "SL" in line:
-            nums = re.findall(r"[\d.]+", line)
-            result["sl"] = float(nums[0])
-            continue
-
-        # TP
-        if "TP" in line:
-            nums = re.findall(r"[\d.]+", line)
-            if nums:
-                result["tp"].append(float(nums[0]))
-            continue
-
-    return result
-# ================================================================
-
-# ==================== PRD 3: Google Sheets Setup ====================
-# Assumes you have a service account JSON key in env var SHEETS_CREDS_JSON
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-CREDS = service_account.Credentials.from_service_account_file(
-    os.getenv("SHEETS_CREDS_JSON"), scopes=SCOPES
-)
-SHEETS = build("sheets", "v4", credentials=CREDS)
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-
-def append_order_to_sheet(order: dict):
-    """
-    PRD 1 & 3:
-    • Map parsed fields to the “Orders” sheet columns:
-      [ user_id, action, symbol, entry_min, entry_max, sl, tp1, tp2…, status, copy_mode ]
-    • Append a new row via Sheets API.
-    """
-    row = [
-        order["user_id"],
-        order["action"],
-        order["symbol"],
-        order["entry_min"],
-        order["entry_max"],
-        order["sl"],
-    ] + order["tp"] + [
-        order["status"],
-        order["copy_mode"]
-    ]
-    # Write to Orders sheet, starting at A1 header row
-    SHEETS.spreadsheets().values().append(
-        spreadsheetId=SPREADSHEET_ID,
-        range="Orders!A2",
-        valueInputOption="USER_ENTERED",
-        body={"values": [row]}
-    ).execute()
-# ============================================================
-
-# ========================================
-# Phase 2: UserConfig Sheet Integration
-# ========================================
-CONFIG_RANGE = "UserConfig!A:D"
-# Columns: A=user_id, B=orders_path, C=alerts_path, D=copy_mode
-
-def get_user_config(user_id: str) -> dict:
-    """Fetches the row for user_id, returns dict with keys orders_path, alerts_path, copy_mode."""
-    sheet = SHEETS.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=CONFIG_RANGE
-    ).execute()
-    rows = sheet.get("values", [])
-    for row in rows[1:]:  # skip header
-        if row[0] == user_id:
-            return {
-                "orders_path": row[1] if len(row) > 1 else "",
-                "alerts_path": row[2] if len(row) > 2 else "",
-                "copy_mode": row[3] if len(row) > 3 else "pending"
-            }
-    return {"orders_path": "", "alerts_path": "", "copy_mode": "pending"}
-
-def update_user_config(user_id: str, field: str, value: str):
-    """
-    Upserts a single field in UserConfig.
-    field ∈ {"orders_path","alerts_path","copy_mode"}.
-    """
-    # 1) Read full sheet
-    sheet = SHEETS.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID,
-        range=CONFIG_RANGE
-    ).execute()
-    rows = sheet.get("values", [])
-    header = rows[0]
-    try:
-        idx = header.index(field)
-    except ValueError:
-        return
-
-    # 2) Find existing row or append new
-    for i,row in enumerate(rows[1:], start=1):
-        if row[0] == user_id:
-            # update cell
-            SHEETS.spreadsheets().values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range=f"UserConfig!{chr(65+idx)}{i+1}",
-                valueInputOption="USER_ENTERED",
-                body={"values":[[value]]}
-            ).execute()
-            return
-
-    # 3) Append new row if not found
-    new_row = [user_id, "", "", ""]
-    new_row[idx] = value
-    SHEETS.spreadsheets().values().append(
-        spreadsheetId=SPREADSHEET_ID,
-        range="UserConfig!A2",
-        valueInputOption="USER_ENTERED",
-        body={"values":[new_row]}
-    ).execute()
 
 # ========== Inline Keyboard ==========
 def main_menu():
     keyboard = [
         [InlineKeyboardButton("Buy", callback_data="buy_prompt")],
         [InlineKeyboardButton("Sell", callback_data="sell_prompt")],
-        [InlineKeyboardButton("Set Orders Path", callback_data="set_orders_path")],
-        [InlineKeyboardButton("Set Alerts Path", callback_data="set_alerts_path")],
         [InlineKeyboardButton("Set Alert", callback_data="set_alert_prompt")],
         [InlineKeyboardButton("Parse Signal", callback_data="parse_signal")]
     ]
@@ -203,126 +38,120 @@ def main_menu():
 
 # ========== Start Command ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = _link_user(update.effective_user)
+    sb.table("user_settings").upsert({"user_id": user_id, "copy_mode": "pending"}).execute()
     await context.bot.send_message(
         chat_id=update.effective_user.id,
         text="👋 Welcome! Choose a function or type a command:",
         reply_markup=main_menu()
     )
 
-# ========== Set MT5 Path ==========
-async def set_orders_path(update: Update, context: ContextTypes.DEFAULT_TYPE): #Currently taking multi-step approach
-    await context.bot.send_message(
-        chat_id=update.effective_user.id,
-        text="📁 Send your MT5 Orders folder path:"
-    )
-    return ASKING_PATH
 
-async def save_orders_path(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def save_orders_path(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = _link_user(update.effective_user)
     path = update.message.text.strip()
-    if not os.path.exists(path):
-        await update.message.reply_text("❌ That path doesn't exist. Try again.")
-        return ASKING_PATH
-
-    user_id = str(update.effective_user.id)
-    update_user_config(user_id, "orders_path", path)
-    await context.bot.send_message(
-        chat_id=update.effective_user.id,
-        text="✅ Path saved! You can now use /buy or /sell.",
-        reply_markup=main_menu()
-    )
+    # store regardless of local existence check (VM/remote)
+    sb.table("user_settings").upsert({"user_id": user_id, "orders_path": path}).execute()
+    await update.message.reply_text("✅ Path saved! Use /buy or /sell.")
     return ConversationHandler.END
 
-# ========== Set Alerts Path ==========
-async def set_alerts_path(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(
-        chat_id=update.effective_user.id,
-        text="📂 Please send the folder path where MT5 will read alerts.json:"
-    )
-    return ASKING_ALERTS_PATH
 
-async def save_alerts_path(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    path = update.message.text.strip()
-    if not os.path.exists(path):
-        await update.message.reply_text("❌ That path doesn't exist. Try again.")
-        return ASKING_ALERTS_PATH
-
-    user_id = str(update.effective_user.id)
-    update_user_config(user_id, "alerts_path", path)
-    await context.bot.send_message(
-        chat_id=update.effective_user.id,
-        text="✅ Alerts path saved!",
-        reply_markup=main_menu()
-    )
-    return ConversationHandler.END
 async def set_copy_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = _link_user(update.effective_user)
     mode = (context.args[0].lower() if context.args else "")
     if mode not in ("auto","pending"):
-        await update.message.reply_text("Usage: /setcopymode auto|pending")
-        return
-    user_id = str(update.effective_user.id)
-    update_user_config(user_id, "copy_mode", mode)
+      await update.message.reply_text("Usage: /setcopymode auto|pending")
+      return
+    sb.table("user_settings").upsert({"user_id": user_id, "copy_mode": mode}).execute()
     await update.message.reply_text(f"✅ Copy mode set to *{mode}*.", parse_mode="Markdown")
 
-# ========== Buy & Sell ==========
-async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _load_user_settings(user_id: str):
+    q = sb.table("user_settings").select("*").eq("user_id", user_id).limit(1).execute()
+    return (q.data or [{}])[0]
+
+def _pick_account_id(user_id: str) -> str:
+    s = _load_user_settings(user_id)
+    if s.get("default_account_id"):
+        return s["default_account_id"]
+    q = sb.table("accounts").select("id").eq("user_id", user_id).eq("status","active").limit(1).execute()
+    if not q.data:
+        raise RuntimeError("No active account configured.")
+    return q.data[0]["id"]
+# ------- BUY / SELL → signal + (auto/pending) order via RPC -------
+def _mk_meta(symbol: str, volume: float, sl=None, tp=None):
+    meta = {"symbol": symbol, "side": None, "size": volume}
+    if sl is not None: meta["sl"] = sl
+    if tp is not None: meta["tp"] = tp
+    return meta
+
+async def _place_order(update: Update, ctx: ContextTypes.DEFAULT_TYPE, side: str):
     try:
-        user_id = str(update.effective_user.id)
-        if user_id not in user_paths:
-            await context.bot.send_message(chat_id=update.effective_user.id, text="⚠️ Set your MT5 path first using /setorderspath.")
-            return
+        user_id = _link_user(update.effective_user)
+        args = ctx.args
+        symbol = args[0].upper()
+        volume = float(args[1])
+        sl = None; tp = None  # (optional: read from args)
+        account_id = _pick_account_id(user_id)
 
-        symbol = context.args[0]
-        volume = float(context.args[1])
-        order = {"action": "buy", "symbol": symbol, "volume": volume}
-        filepath = os.path.join(user_paths[user_id], 'order.json')
+        # 1) create signal
+        sig = sb.rpc("rpc_create_signal", {
+            "p_master_id": user_id,
+            "p_symbol": symbol,
+            "p_side": side,
+            "p_size": volume,
+            "p_sl": sl,
+            "p_tp": json.dumps(tp) if tp else json.dumps([])
+        }).execute().data
 
-        orders = []
-        if os.path.exists(filepath):
-            with open(filepath, 'r') as f:
-                try:
-                    loaded = json.load(f)
-                    orders = loaded if isinstance(loaded, list) else [loaded]
-                except json.JSONDecodeError:
-                    orders = []
+        # 2) queue order (auto vs pending)
+        res = sb.rpc("rpc_queue_order_with_approval", {
+            "p_user_id": user_id,
+            "p_account_id": account_id,
+            "p_signal_id": sig["id"],
+            "p_client_order_id": f"tg-{update.message.id}",
+            "p_meta": _mk_meta(symbol, volume, sl, tp)
+        }).execute().data
 
-        orders.append(order)
+        order = res["order"]
+        appr = res.get("approval")
 
-        with open(filepath, 'w') as f:
-            json.dump(orders, f, indent=2)
-
-        await context.bot.send_message(chat_id=update.effective_user.id, text=f"🟢 Buy order saved: {symbol}, {volume} lots")
+        if appr:
+            token = appr["callback_token"]
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Yes", callback_data=f"appr:{token}:yes"),
+                InlineKeyboardButton("❌ No",  callback_data=f"appr:{token}:no")
+            ]])
+            await update.message.reply_text(
+                f"Approve order?\n{side.upper()} {symbol} x {volume}",
+                reply_markup=kb
+            )
+        else:
+            await update.message.reply_text(
+                f"Queued (auto): {side.upper()} {symbol} x {volume}\nOrder: {order['id']}"
+            )
     except Exception as e:
-        await context.bot.send_message(chat_id=update.effective_user.id, text=f"❌ Error: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
 
-async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _place_order(update, ctx, "buy")
+
+async def sell(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _place_order(update, ctx, "sell")
+
+# ------- Inline approval callback -------
+async def handle_approval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
     try:
-        user_id = str(update.effective_user.id)
-        if user_id not in user_paths:
-            await context.bot.send_message(chat_id=update.effective_user.id, text="⚠️ Set your MT5 path first using /setorderspath.")
-            return
-
-        symbol = context.args[0]
-        volume = float(context.args[1])
-        order = {"action": "sell", "symbol": symbol, "volume": volume}
-        filepath = os.path.join(user_paths[user_id], 'order.json')
-
-        orders = []
-        if os.path.exists(filepath):
-            with open(filepath, 'r') as f:
-                try:
-                    loaded = json.load(f)
-                    orders = loaded if isinstance(loaded, list) else [loaded]
-                except json.JSONDecodeError:
-                    orders = []
-
-        orders.append(order)
-
-        with open(filepath, 'w') as f:
-            json.dump(orders, f, indent=2)
-
-        await context.bot.send_message(chat_id=update.effective_user.id, text=f"🔴 Sell order saved: {symbol}, {volume} lots")
+        _, token, decision = q.data.split(":", 2)  # "appr:<token>:yes|no"
+        res = sb.rpc("rpc_record_approval", {
+            "p_callback_token": token,
+            "p_decision": decision
+        }).execute().data
+        new_status = res["order"]["status"]
+        await q.edit_message_text(f"Decision recorded: {decision.upper()} ➜ order {new_status}")
     except Exception as e:
-        await context.bot.send_message(chat_id=update.effective_user.id, text=f"❌ Error: {e}")
+        await q.edit_message_text(f"❌ Approval error: {e}")
 
 # ========== Inline Button Logic ==========
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -391,78 +220,29 @@ async def alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📘 *How to use this bot:*\n"
-        "/setorderspath – Set your MT5 orders file path\n"
-        "/setalertspath – Set the alerts file folder path\n"
         "/buy SYMBOL VOLUME – Place a buy order (e.g., /buy EURUSD 0.1)\n"
         "/sell SYMBOL VOLUME – Place a sell order (e.g., /sell USDJPY 0.2)\n"
         "/alert SYMBOL PRICE above|below – Set a price alert\n"
         , parse_mode="Markdown"
     )
 
-async def handle_parse_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Handle callback vs message
-    if update.message:
-        text = " ".join(context.args or [])
-        if not text and update.message.reply_to_message:
-            text = update.message.reply_to_message.text
-    elif update.callback_query:
-        await update.callback_query.answer()
-        text = "BUY EURUSD 1.1000\nTP1 1.1050\nSL 1.0950"  # Example default text
-    else:
-        text = ""
-
-    if not text:
-        await context.bot.send_message(
-            chat_id=update.effective_user.id,
-            text="⚠️ No signal text provided or replied to."
-        )
-        return
-
-    parsed = parse_trade_signal(text)
-    parsed["user_id"] = str(update.effective_user.id)
-    parsed["copy_mode"] = "pending"
-
-    append_order_to_sheet(parsed)
-
-    await context.bot.send_message(
-        chat_id=update.effective_user.id,
-        text=f"✅ Parsed and sent to Orders sheet:\n```json\n{json.dumps(parsed, indent=2)}```",
-        parse_mode="Markdown"
-    )
 
 # ========== Setup ==========
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 # Command handlers
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("parse", handle_parse_signal))
 app.add_handler(CommandHandler("buy", buy))
 app.add_handler(CommandHandler("sell", sell))
-app.add_handler(CommandHandler("alert", alert))
-app.add_handler(CommandHandler("help", help_cmd))
 app.add_handler(CommandHandler("setcopymode", set_copy_mode))
+app.add_handler(CallbackQueryHandler(handle_approval, pattern=r"^appr:"))
+
 
 app.add_handler(CallbackQueryHandler(lambda u,c: c.bot.send_message(
     chat_id=u.callback_query.from_user.id,
     text="Feature in Phase 2/3"
 ), pattern="^(buy_prompt|sell_prompt|setorderspath|set_alerts_path)$"))
-app.add_handler(CallbackQueryHandler(handle_parse_signal, pattern="parse_signal"))
 
-# Conversation handlers
-orders_conv = ConversationHandler(
-    entry_points=[CommandHandler("setorderspath", set_orders_path)],
-    states={ASKING_PATH: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_orders_path)]},
-    fallbacks=[],
-)
-alerts_conv = ConversationHandler(
-    entry_points=[CommandHandler("setalertspath", set_alerts_path)],
-    states={ASKING_ALERTS_PATH: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_alerts_path)]},
-    fallbacks=[],
-)
-
-
-app.add_handler(orders_conv)
-app.add_handler(alerts_conv)
 
 # Inline button handler
 app.add_handler(CallbackQueryHandler(handle_button))
