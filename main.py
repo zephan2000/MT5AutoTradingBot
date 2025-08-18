@@ -7,6 +7,9 @@ from telegram.ext import (
 from uuid import UUID
 from dotenv import load_dotenv
 from lib.supa import service_client
+from lib.parser import parse_trade_signal
+from lib.llm_normalize import normalize_message
+from datetime import datetime, timezone
 # ========== State Constants ==========
 load_dotenv()
 print("DEBUG SUPABASE_URL:", os.getenv("SUPABASE_URL"))
@@ -14,6 +17,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 sb = service_client()
 
 ASKING_PATH, ASKING_ALERTS_PATH = range(2)
+EDIT_STATE = 10
 user_paths = {}
 alerts_paths = {}
 
@@ -32,6 +36,7 @@ def main_menu():
         [InlineKeyboardButton("Buy", callback_data="buy_prompt")],
         [InlineKeyboardButton("Sell", callback_data="sell_prompt")],
         [InlineKeyboardButton("Set Alert", callback_data="set_alert_prompt")],
+         [InlineKeyboardButton("Sources (Subscribe)", callback_data="show_sources")],  # NEW
         [InlineKeyboardButton("Parse Signal", callback_data="parse_signal")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -54,6 +59,13 @@ async def save_orders_path(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sb.table("user_settings").upsert({"user_id": user_id, "orders_path": path}).execute()
     await update.message.reply_text("✅ Path saved! Use /buy or /sell.")
     return ConversationHandler.END
+
+async def show_sources_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user_id = _link_user(q.from_user)
+    text, markup = _render_sources_markup(user_id)
+    await q.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
 
 
 async def set_copy_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -216,6 +228,104 @@ async def alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await context.bot.send_message(chat_id=update.effective_user.id, text=f"❌ Error: {e}")
+
+# ===== Subscriptions UX (inline buttons) =====
+
+def _fetch_sources():
+    res = sb.table("group_sources").select("id,title,chat_id").execute()
+    return res.data or []
+
+def _subscribed_source_ids(user_id: str):
+    q = (
+        sb.table("copy_routes")
+          .select("source_id")
+          .eq("follower_user_id", user_id)
+          .eq("active", True)
+          .execute()
+    )
+    return {row["source_id"] for row in (q.data or [])}
+
+def _render_sources_markup(user_id: str):
+    """Return (text, InlineKeyboardMarkup) showing all sources with per-row Subscribe/Unsubscribe buttons."""
+    sources = _fetch_sources()
+    subs = _subscribed_source_ids(user_id)
+
+    lines = ["📡 *Monitoring Sources*"]
+    keyboard = []
+    for s in sources:
+        sid = s["id"]
+        title = s.get("title") or s["chat_id"]
+        is_sub = sid in subs
+        state = "Subscribed ✅" if is_sub else "Not subscribed"
+        lines.append(f"• *{title}*\n  `{sid}`\n  _{state}_")
+
+        if is_sub:
+            keyboard.append([InlineKeyboardButton("🛑 Unsubscribe", callback_data=f"src:unsub:{sid}")])
+        else:
+            keyboard.append([InlineKeyboardButton("➕ Subscribe", callback_data=f"src:sub:{sid}")])
+
+    # Add a refresh button
+    keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="src:refresh")])
+
+    text = "\n\n".join(lines)
+    return text, InlineKeyboardMarkup(keyboard)
+
+async def sources(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Step 1–2: List all sources with inline buttons (Subscribe / Unsubscribe)."""
+    user_id = _link_user(update.effective_user)  # returns UUID:contentReference[oaicite:1]{index=1}
+    text, markup = _render_sources_markup(user_id)
+    await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
+async def toggle_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Step 3–4: Handle Subscribe/Unsubscribe clicks, update DB, then re-render list."""
+    q = update.callback_query
+    await q.answer()
+    user_id = _link_user(q.from_user)  # returns UUID:contentReference[oaicite:2]{index=2}
+
+    data = q.data  # e.g., "src:sub:<source_id>" or "src:unsub:<source_id>" or "src:refresh"
+    parts = data.split(":")
+    if len(parts) == 2 and parts[1] == "refresh":
+        text, markup = _render_sources_markup(user_id)
+        await q.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+        return
+
+    if len(parts) != 3:
+        await q.edit_message_text("❌ Invalid action.")
+        return
+
+    _, action, source_id = parts
+
+    try:
+        if action == "sub":
+            # Default target = current chat with the bot; can be changed later via a command/UI
+            target_chat_id = str(q.message.chat_id)
+            sb.table("copy_routes").upsert(
+                {
+                    "source_id": source_id,
+                    "follower_user_id": user_id,
+                    "target_chat_id": target_chat_id,
+                    "active": True
+                },
+                on_conflict="source_id,follower_user_id"
+            ).execute()
+
+        elif action == "unsub":
+            sb.table("copy_routes").upsert({
+                "source_id": source_id,
+                "follower_user_id": user_id,
+                "target_chat_id": str(q.message.chat.id),
+                "active": False
+            }, on_conflict="source_id,follower_user_id").execute()
+        else:
+            await q.edit_message_text("❌ Unknown action.")
+            return
+    except Exception as e:
+        await q.edit_message_text(f"❌ Error: {e}")
+        return
+
+    # Re-render updated list
+    text, markup = _render_sources_markup(user_id)
+    await q.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
 # ========== Help Command Function ==========
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -225,25 +335,114 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/alert SYMBOL PRICE above|below – Set a price alert\n"
         , parse_mode="Markdown"
     )
+# ===== Execute / Ignore coming from tele_agent buttons =====
+async def handle_exec_choice(update, ctx):
+    q = update.callback_query
+    await q.answer()
+    decision, uim_id = q.data.split(":")[1:]
+    uim = (sb.table("user_inbound_messages")
+             .select("id, user_id, inbound_message_id, status")
+             .eq("id", int(uim_id)).single().execute().data)
+    if not uim:
+        return await q.edit_message_text("❌ Not found/expired.")
 
+    if decision == "no":
+        sb.table("user_inbound_messages").update({
+            "status": "ignored", "decided_at": datetime.now(timezone.utc).isoformat()
+        }).eq("id", uim["id"]).execute()
+        return await q.edit_message_text("🚫 Ignored.")
+
+    # decision == "yes": load parsed payload from the shared inbound
+    inbound = (sb.table("inbound_messages")
+                 .select("parsed_json")
+                 .eq("id", uim["inbound_message_id"]).single().execute().data)
+    parsed = inbound["parsed_json"] or {}
+    # (validate fields again if you want)
+    user_id = uim["user_id"]
+
+    # choose account
+    acct = (sb.table("accounts")
+              .select("id")
+              .eq("user_id", user_id).eq("status","active")
+              .limit(1).execute().data)
+    if not acct: 
+        return await q.edit_message_text("❌ No active account configured.")
+    account_id = acct[0]["id"]
+
+    # create signal (user-approved intent)
+    sig = sb.rpc("rpc_create_signal", {
+        "p_master_id": user_id,
+        "p_symbol": parsed["symbol"],
+        "p_side": parsed["action"],           # 'buy'|'sell'
+        "p_size": 0.01,                       # TODO: from user_settings
+        "p_sl": parsed.get("sl"),
+        "p_tp": parsed.get("tp")
+    }).execute().data
+
+    # create a DB order row (no execution yet)
+    sb.rpc("rpc_create_order", {
+        "p_user_id": user_id,
+        "p_account_id": account_id,
+        "p_signal_id": sig["id"],
+        "p_client_order_id": f"tg:{uim_id}",  # per-user idempotency
+        "p_meta": {"uim_id": uim_id}
+    }).execute()
+
+    # mark the user's decision executed
+    sb.table("user_inbound_messages").update({
+        "status": "executed", "decided_at": datetime.now(timezone.utc).isoformat()
+    }).eq("id", uim_id).execute()
+
+    await q.edit_message_text(f"✅ Recorded: {parsed['action'].upper()} {parsed['symbol']}")
+# ========== Log Chat ID ==========
+async def log_chat_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    origin = getattr(update.message, "forward_origin", None)
+
+    if origin and getattr(origin, "chat", None):
+        src_id = origin.chat.id          # <-- this is the group/channel ID
+        src_title = origin.chat.title
+        print(f"[FORWARDED FROM] id={src_id} title={src_title}")
+        await update.message.reply_text(f"Forwarded from:\nID: `{src_id}`\nTitle: {src_title or '(no title)' }",
+                                        parse_mode="Markdown")
+    else:
+        # Forward origin hidden or not a forward. Fall back guidance:
+        await update.message.reply_text(
+            "Couldn’t read the source chat id from this forward.\n"
+            "• Some groups/channels hide forward origin.\n"
+            "• Add the bot to the group and send any message, or /id there, to capture its chat id."
+        )
+
+    # optional: bring user back to your menu
+    await ctx.bot.send_message(chat_id=update.effective_user.id,
+                               text="👋 Choose a function:",
+                               reply_markup=main_menu())
 
 # ========== Setup ==========
 app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+
 
 # Command handlers
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("buy", buy))
 app.add_handler(CommandHandler("sell", sell))
 app.add_handler(CommandHandler("setcopymode", set_copy_mode))
-app.add_handler(CallbackQueryHandler(handle_approval, pattern=r"^appr:"))
+app.add_handler(CallbackQueryHandler(handle_exec_choice, pattern=r"^exec:(yes|no):"))
+app.add_handler(CommandHandler("sources", sources))
+app.add_handler(CallbackQueryHandler(toggle_source, pattern=r"^src:(sub|unsub|refresh)"))
+app.add_handler(CallbackQueryHandler(show_sources_btn, pattern=r"^show_sources$"))
+
+
 
 
 app.add_handler(CallbackQueryHandler(lambda u,c: c.bot.send_message(
+
     chat_id=u.callback_query.from_user.id,
     text="Feature in Phase 2/3"
 ), pattern="^(buy_prompt|sell_prompt|setorderspath|set_alerts_path)$"))
 
-
+# Register Log Chat ID handler in your application
+app.add_handler(MessageHandler(filters.ALL, log_chat_id))
 # Inline button handler
 app.add_handler(CallbackQueryHandler(handle_button))
 
