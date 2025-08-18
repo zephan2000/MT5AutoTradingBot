@@ -1,5 +1,5 @@
 import os, json, re
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ForceReply
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, ConversationHandler,
     CallbackQueryHandler, ContextTypes, filters
@@ -28,6 +28,28 @@ def _link_user(telegram_user) -> str:
         "p_username": telegram_user.username or ""
     }).execute()
     return res.data
+
+def _get_payload_for_uim(uim_id: int):
+    """Return merged payload: edited_json over parsed_json."""
+    uim = (sb.table("user_inbound_messages")
+             .select("edited_json,inbound_message_id")
+             .eq("id", uim_id).single().execute().data)
+    inbound = (sb.table("inbound_messages")
+                 .select("parsed_json")
+                 .eq("id", uim["inbound_message_id"]).single().execute().data)
+    base = inbound.get("parsed_json") or {}
+    edited = uim.get("edited_json") or {}
+    merged = {**base, **{k:v for k,v in edited.items() if v not in (None, "", [])}}
+    return merged
+
+def _patch_edited_json(uim_id: int, patch: dict):
+    uim = (sb.table("user_inbound_messages")
+             .select("edited_json")
+             .eq("id", uim_id).single().execute().data)
+    edited = uim.get("edited_json") or {}
+    edited.update(patch)
+    sb.table("user_inbound_messages").update({"edited_json": edited}).eq("id", uim_id).execute()
+
 
 
 # ========== Inline Keyboard ==========
@@ -335,7 +357,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/alert SYMBOL PRICE above|below – Set a price alert\n"
         , parse_mode="Markdown"
     )
-# ===== Execute / Ignore coming from tele_agent buttons =====
+# ===== Review/Adjust coming from tele_agent buttons =====
 async def handle_exec_choice(update, ctx):
     q = update.callback_query
     await q.answer()
@@ -352,49 +374,248 @@ async def handle_exec_choice(update, ctx):
         }).eq("id", uim["id"]).execute()
         return await q.edit_message_text("🚫 Ignored.")
 
-    # decision == "yes": load parsed payload from the shared inbound
+# 2.a) Start review/adjust screen
+async def handle_review(update, ctx):
+    q = update.callback_query
+    await q.answer()
+    uim_id = int(q.data.split(":")[1])
+
+    parsed = _get_payload_for_uim(uim_id)  # merged payload
+
+    # Show current values & ask for optional edit
+    summary = (
+        f"Review/Adjust your order:\n"
+        f"Symbol: {parsed.get('symbol')}\n"
+        f"Side: {parsed.get('action')}\n"
+        f"Entry: {parsed.get('entry_min')}–{parsed.get('entry_max')}\n"
+        f"SL: {parsed.get('sl')}\n"
+        f"TP: {', '.join([str(x) for x in (parsed.get('tp') or [])]) or '—'}\n\n"
+        f"• Use the field buttons to tweak *one* value\n"
+        f"• Or reply in one line to replace *all* values:\n"
+        f"`SYMBOL SIDE ENTRY_MIN [ENTRY_MAX] SL TP1,TP2,...`"
+        f"Example: `WLDUSDT buy 1.0413 1.1045 1.0132 1.1343,1.1641,1.1940,1.2834`\n"
+        f"Or tap **Select Broker** to use current values."
+    )
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔤 Symbol",    callback_data=f"edit:symbol:{uim_id}"),
+         InlineKeyboardButton("↕️ Side",      callback_data=f"edit:action:{uim_id}")],
+        [InlineKeyboardButton("🎯 Entry Min", callback_data=f"edit:entry_min:{uim_id}"),
+         InlineKeyboardButton("🎯 Entry Max", callback_data=f"edit:entry_max:{uim_id}")],
+        [InlineKeyboardButton("🛑 Stop Loss", callback_data=f"edit:sl:{uim_id}"),
+         InlineKeyboardButton("🎯 Targets",   callback_data=f"edit:tp:{uim_id}")],
+        [InlineKeyboardButton("💼 Select Broker", callback_data=f"brokerlist:{uim_id}")],
+        [InlineKeyboardButton("🚫 Cancel",        callback_data=f"exec:no:{uim_id}")]
+    ])
+    ctx.user_data[f"await_edit_{uim_id}"] = True
+    await q.edit_message_text(summary, parse_mode="Markdown", reply_markup=kb)
+
+
+# 2.b) Handle user’s text edit (optional)
+async def handle_adjust_message(update, ctx):
+    text = (update.message.text or "").strip()
+    # find any uim awaiting edit for this user
+    awaiting = [k for k in list(ctx.user_data.keys()) if k.startswith("await_edit_") and ctx.user_data.get(k)]
+    if not awaiting:
+        return  # not in edit mode
+
+    uim_id = int(awaiting[0].split("_")[-1])
+
+    try:
+        # Parse simple line: SYMBOL SIDE ENTRY_MIN [ENTRY_MAX] SL TP1,TP2,...
+        parts = text.replace(",", " ").split()
+        if len(parts) < 5:
+            return await update.message.reply_text("Format error. Need: SYMBOL SIDE ENTRY_MIN [ENTRY_MAX] SL TP1,TP2,...")
+
+        symbol = parts[0]
+        side   = parts[1].lower()  # buy/sell
+        entry_min = float(parts[2])
+        idx = 3
+        entry_max = None
+        # If the “next” token looks like a price and we still have enough tokens for SL + at least one TP
+        if len(parts) >= 6:
+            try:
+                maybe_max = float(parts[3])
+                entry_max = maybe_max
+                idx = 4
+            except:
+                pass
+        sl = float(parts[idx]); idx += 1
+        tps = [float(p) for p in parts[idx:]] if idx < len(parts) else []
+
+        edited = {
+            "symbol": symbol,
+            "action": side,
+            "entry_min": entry_min,
+            "entry_max": entry_max,
+            "sl": sl,
+            "tp": tps
+        }
+
+        # Save edits (DB preferred)
+        sb.table("user_inbound_messages").update({"edited_json": edited}).eq("id", uim_id).execute()
+        # clear flag
+        ctx.user_data.pop(f"await_edit_{uim_id}", None)
+
+        # Prompt broker selection
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("💼 Select Broker", callback_data=f"brokerlist:{uim_id}")]])
+        await update.message.reply_text("✅ Edits saved. Now select a broker:", reply_markup=kb)
+
+    except Exception as e:
+        await update.message.reply_text(f"Parse error: {e}")
+
+# 2.c) Start an edit for one field
+async def handle_edit_field(update, ctx):
+    q = update.callback_query
+    await q.answer()
+    _, field, uim_id = q.data.split(":")
+    uim_id = int(uim_id)
+
+    parsed = _get_payload_for_uim(uim_id)
+    current = parsed.get(field)
+    ctx.user_data["edit_field"] = (uim_id, field)
+    ctx.user_data.pop(f"await_edit_{uim_id}", None)  # pause bulk while single-field edit is active
+    await q.message.reply_text("Reply here with the new value:", reply_markup=ForceReply(selective=True))
+    hint = "comma-separated (e.g. 1.1343,1.1641)" if field == "tp" else "a single value"
+    await q.edit_message_text(
+        f"Send *{field}* ({hint}). Current: `{current}`\n\n",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f"review:{uim_id}")]])
+    )
+
+# 2.d) Handle In-line edit button values
+async def handle_edit_value(update, ctx):
+    if "edit_field" not in ctx.user_data:
+        return
+    uim_id, field = ctx.user_data.pop("edit_field")
+    raw = (update.message.text or "").strip()
+
+    try:
+        if field in ("entry_min", "entry_max", "sl"):
+            val = float(raw)
+            _patch_edited_json(uim_id, {field: val})
+        elif field == "tp":
+            # allow comma/space separated list
+            parts = [p for p in re.split(r"[,\s]+", raw) if p]
+            tps = [float(p) for p in parts]
+            _patch_edited_json(uim_id, {"tp": tps})
+        elif field == "action":
+            side = raw.lower().strip()
+            if side not in ("buy", "sell", "long", "short"):
+                return await update.message.reply_text("Use one of: buy/sell/long/short")
+            # normalize to buy/sell
+            side = "buy" if side in ("buy", "long") else "sell"
+            _patch_edited_json(uim_id, {"action": side})
+        elif field == "symbol":
+            _patch_edited_json(uim_id, {"symbol": raw.upper()})
+        else:
+            return await update.message.reply_text("Unknown field.")
+    except Exception as e:
+        return await update.message.reply_text(f"Parse error: {e}")
+
+    # show updated summary again
+    parsed = _get_payload_for_uim(uim_id)
+    summary = (
+        f"Updated:\n"
+        f"*Symbol*: {parsed.get('symbol')}\n"
+        f"*Side*: {parsed.get('action')}\n"
+        f"*Entry*: {parsed.get('entry_min')}–{parsed.get('entry_max')}\n"
+        f"*SL*: {parsed.get('sl')}\n"
+        f"*TP*: {', '.join([str(x) for x in (parsed.get('tp') or [])]) or '—'}"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💼 Select Broker", callback_data=f"brokerlist:{uim_id}")],
+        [InlineKeyboardButton("⬅️ More Edits",   callback_data=f"review:{uim_id}")],
+    ])
+    await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=kb)
+
+
+
+# 2.e) Show broker list and then finalize order
+async def handle_brokerlist(update, ctx):
+    q = update.callback_query
+    await q.answer()
+    uim_id = int(q.data.split(":")[1])
+
+    uim = (sb.table("user_inbound_messages")
+             .select("id,user_id,edited_json,inbound_message_id")
+             .eq("id", uim_id).single().execute().data)
+
+    # List accounts for this user
+    accts = (sb.table("accounts")
+               .select("id, broker")
+               .eq("user_id", uim["user_id"])
+               .eq("status", "active")
+               .execute().data) or []
+    if not accts:
+        return await q.edit_message_text("⚠️ No active accounts found. Add one first.")
+
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(a["broker"], callback_data=f"broker:{a['id']}:{uim_id}")]
+         for a in accts]
+    )
+    await q.edit_message_text("Select broker:", reply_markup=kb)
+
+
+async def handle_broker_choice(update, ctx):
+    q = update.callback_query
+    await q.answer()
+    _, account_id, uim_id = q.data.split(":")
+    uim_id = int(uim_id)
+
+    # Load edited or original parsed
+    uim = (sb.table("user_inbound_messages")
+             .select("id,user_id,edited_json,inbound_message_id")
+             .eq("id", uim_id).single().execute().data)
     inbound = (sb.table("inbound_messages")
-                 .select("parsed_json")
-                 .eq("id", uim["inbound_message_id"]).single().execute().data)
-    parsed = inbound["parsed_json"] or {}
-    # (validate fields again if you want)
-    user_id = uim["user_id"]
+             .select("parsed_json, source_id")   # <-- source_id IS group_sources.id
+             .eq("id", uim["inbound_message_id"]).single().execute().data)
 
-    # choose account
-    acct = (sb.table("accounts")
-              .select("id")
-              .eq("user_id", user_id).eq("status","active")
-              .limit(1).execute().data)
-    if not acct: 
-        return await q.edit_message_text("❌ No active account configured.")
-    account_id = acct[0]["id"]
+    parsed = _get_payload_for_uim(uim_id)
+    required = ("symbol", "action", "entry_min")
+    # send a separate debug message (don’t edit the same one)
+    await q.message.reply_text("Order Review:\n" + json.dumps(parsed, indent=2))
+    # normalize keys before the required check
+    side = parsed.get("side") or parsed.get("action")
+    entry_min = parsed.get("entry_min")
+    if entry_min is None and isinstance(parsed.get("entry"), (int, float)):
+        entry_min = parsed["entry"]  # fallback if your parser used 'entry'
 
-    # create signal (user-approved intent)
-    sig = sb.rpc("rpc_create_signal", {
-        "p_master_id": user_id,
+    if not (parsed.get("symbol") and side and entry_min):
+        return await q.edit_message_text("❌ Invalid order payload. Try editing again.")
+
+    group_source_id = inbound.get("source_id")  # this will be your group_sources.id
+    # Create signal (now with group_source_id)
+    sig_id = (sb.rpc("rpc_create_signal", {
+        "p_master_id": uim["user_id"],
         "p_symbol": parsed["symbol"],
-        "p_side": parsed["action"],           # 'buy'|'sell'
-        "p_size": 0.01,                       # TODO: from user_settings
+        "p_side": (parsed.get("side") or parsed.get("action")),   # normalize
+        "p_size": 0.01,                                            # TODO: user setting
         "p_sl": parsed.get("sl"),
-        "p_tp": parsed.get("tp")
-    }).execute().data
+        "p_tp": parsed.get("tp"),
+        "p_group_source_id": group_source_id
+    }).execute().data)
+    # Supabase py client may return a list; normalize:
+    if isinstance(sig_id, list):
+        sig_id = sig_id[0]
 
-    # create a DB order row (no execution yet)
+    # Create order (per-user)
     sb.rpc("rpc_create_order", {
-        "p_user_id": user_id,
-        "p_account_id": account_id,
-        "p_signal_id": sig["id"],
-        "p_client_order_id": f"tg:{uim_id}",  # per-user idempotency
-        "p_meta": {"uim_id": uim_id}
+        "p_user_id": uim["user_id"],
+        "p_account_id": account_id,                # from the broker button
+        "p_signal_id": sig_id,
+        "p_client_order_id": f"tg:{uim_id}",       # per-user idempotency
+        "p_meta": {"uim_id": uim_id}               # send dict -> jsonb
     }).execute()
 
-    # mark the user's decision executed
+    # Mark this user's decision as executed
     sb.table("user_inbound_messages").update({
-        "status": "executed", "decided_at": datetime.now(timezone.utc).isoformat()
+        "status": "executed",
+        "decided_at": datetime.now(timezone.utc).isoformat()
     }).eq("id", uim_id).execute()
 
-    await q.edit_message_text(f"✅ Recorded: {parsed['action'].upper()} {parsed['symbol']}")
-# ========== Log Chat ID ==========
+    await q.edit_message_text(f"✅ Order saved for {parsed['symbol']} ({parsed['action'].upper()})")
+
 async def log_chat_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     origin = getattr(update.message, "forward_origin", None)
 
@@ -422,27 +643,31 @@ app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 
 
-# Command handlers
+# Specific callbacks first
+app.add_handler(CallbackQueryHandler(handle_exec_choice,   pattern=r"^exec:(yes|no):"))
+app.add_handler(CallbackQueryHandler(show_sources_btn,     pattern=r"^show_sources$"))
+app.add_handler(CallbackQueryHandler(toggle_source,        pattern=r"^src:(sub|unsub|refresh)"))
+app.add_handler(CallbackQueryHandler(handle_review,        pattern=r"^review:\d+$"))
+app.add_handler(CallbackQueryHandler(handle_edit_field,    pattern=r"^edit:(symbol|action|entry_min|entry_max|sl|tp):\d+$"))
+app.add_handler(CallbackQueryHandler(handle_brokerlist,    pattern=r"^brokerlist:\d+$"))
+app.add_handler(CallbackQueryHandler(handle_broker_choice, pattern=r"^broker:[a-zA-Z0-9\-]+:\d+$"))
+
+# Text replies for single-field edits (don’t force REPLY; we use ctx.user_data["edit_field"])
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_value))
+
+# Bulk one-line edits (armed by ctx.user_data[f"await_edit_{uim_id}"])
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_adjust_message))
+
+# Commands
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("buy", buy))
 app.add_handler(CommandHandler("sell", sell))
 app.add_handler(CommandHandler("setcopymode", set_copy_mode))
-app.add_handler(CallbackQueryHandler(handle_exec_choice, pattern=r"^exec:(yes|no):"))
 app.add_handler(CommandHandler("sources", sources))
-app.add_handler(CallbackQueryHandler(toggle_source, pattern=r"^src:(sub|unsub|refresh)"))
-app.add_handler(CallbackQueryHandler(show_sources_btn, pattern=r"^show_sources$"))
 
-
-
-
-app.add_handler(CallbackQueryHandler(lambda u,c: c.bot.send_message(
-
-    chat_id=u.callback_query.from_user.id,
-    text="Feature in Phase 2/3"
-), pattern="^(buy_prompt|sell_prompt|setorderspath|set_alerts_path)$"))
-
-# Register Log Chat ID handler in your application
+# ONE catch-all, LAST
 app.add_handler(MessageHandler(filters.ALL, log_chat_id))
+
 # Inline button handler
 app.add_handler(CallbackQueryHandler(handle_button))
 

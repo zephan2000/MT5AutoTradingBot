@@ -98,7 +98,7 @@ async def send_to_followers(
     sl_text = parsed.get('sl') if parsed.get('sl') is not None else "—"
     tp_text = ", ".join(str(x) for x in (parsed.get('tp') or [])) or "—"
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("▶️ Execute", callback_data=f"exec:yes:{uim_id}"),
+        InlineKeyboardButton("✏️ Review/Adjust Order", callback_data=f"review:{uim_id}"),
         InlineKeyboardButton("🚫 Ignore",  callback_data=f"exec:no:{uim_id}")    ]])
 
     await bot.send_message(
@@ -107,8 +107,8 @@ async def send_to_followers(
             f"Symbol: {parsed['symbol']} | Side: {parsed['action'].upper()}\n"
             f"Entry: {entry_text} | Stop: {sl_text}\n"
             f"Targets: {tp_text}\n"
-            f"Source msg: {message_id}"
-            f"Choose: Execute or Ignore"),
+            f"Source msg: {message_id}\n"
+            f"Choose: Review/Adjust or Ignore"),
     reply_markup=kb
     )
   
