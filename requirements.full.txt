@@ -1,0 +1,9 @@
+# Consolidated dependencies for the bot
+python-telegram-bot>=20.7,<21
+supabase>=2.5.0
+python-dotenv>=1.0.1
+spacy>=3.7,<4
+pydantic>=2.7,<3
+Flask>=3.0.0
+telethon>=1.36.0
+
